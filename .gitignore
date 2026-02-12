@@ -5,7 +5,6 @@ __pycache__/
 *.pyc
 
 # Data files
-dashboard/leads_data.json
 *.log
 
 # IDE
