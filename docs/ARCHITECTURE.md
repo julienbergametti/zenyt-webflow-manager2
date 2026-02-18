@@ -57,7 +57,9 @@ zenyt-webflow-manager/
 │   ├── calendly_sync.py    # Meeting sync
 │   ├── deal_sync.py        # Deal progress sync
 │   ├── company_manager.py  # Company operations
-│   └── contact_manager.py  # Contact operations
+│   ├── contact_manager.py  # Contact operations
+│   ├── email_generator.py  # Pre-call email draft generation
+│   └── prospect_manager.py # Prospect folder/file creation
 │
 ├── scripts/
 │   ├── generate_link.py    # Create tracking links
@@ -146,7 +148,8 @@ contact_manager.associate_to_company(contact, company)
 - Analytics (aggregate data)
 
 **Lead Actions**
-- Push to HubSpot
+- Push to HubSpot (auto-generates pre-call email draft)
+- Find LinkedIn profile (Apollo People Match)
 - Reject with reason
 - Re-enrich with Apollo
 - View HubSpot record
@@ -214,9 +217,13 @@ contact_manager.associate_to_company(contact, company)
 # Lead Management
 GET  /api/leads                    # Get all leads
 POST /api/leads/reload             # Sync from Webflow
-POST /api/leads/{id}/push          # Push to HubSpot
+POST /api/leads/{id}/push          # Push to HubSpot (returns email_draft)
 POST /api/leads/{id}/reject        # Reject lead
 POST /api/leads/{id}/enrich        # Re-enrich with Apollo
+POST /api/leads/{id}/find-linkedin # Auto-find LinkedIn profile (Apollo People Match)
+POST /api/leads/{id}/save-linkedin # Manually save LinkedIn URL
+POST /api/leads/{id}/test          # Mark lead as test
+POST /api/leads/{id}/already-booked # Mark as already booked
 
 # HubSpot Integration
 GET  /api/hubspot/check/{id}       # Check if lead exists
@@ -246,7 +253,8 @@ POST /crm/v3/objects/contacts/{id}/associations/companies
 
 **Apollo**
 ```
-GET /api/v1/organizations/enrich?domain={domain}
+GET  /api/v1/organizations/enrich?domain={domain}   # Company enrichment
+POST /api/v1/people/match                            # LinkedIn profile finder
 ```
 
 **Calendly**

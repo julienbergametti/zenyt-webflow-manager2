@@ -40,6 +40,34 @@ Each lead card has an enrichment button:
 - **"✨ Enrich with Apollo"** (for non-enriched leads)
 - **"🔄 Re-enrich with Apollo"** (to update existing data)
 
+## LinkedIn Profile Finder (People Match)
+
+In addition to company enrichment, Apollo is used to find each prospect's personal LinkedIn profile.
+
+### How It Works
+
+1. Lead card shows **"in?"** button next to the email address
+2. Clicking it calls Apollo's `/v1/people/match` endpoint
+3. **Strategy 1**: Match by email address (highest accuracy)
+4. **Strategy 2**: Fallback to first name + last name + organization/domain
+5. If found, the **"in?"** button turns into a clickable **"in"** link to the profile
+6. If not found, manual search links (Google, LinkedIn) are shown with a paste input
+
+### Hit Rate
+
+Testing across real prospects shows ~83% success rate using email-first matching.
+
+### Data Returned
+
+- LinkedIn profile URL
+- Full name, title, headline
+- Organization name
+- City, country
+
+### Integration with HubSpot
+
+When a lead is pushed to HubSpot, the LinkedIn profile URL is stored in the built-in `linkedin` contact property. The URL field is also available in the push modal for manual entry or correction.
+
 ## ICP Scoring Framework (0-100 Points)
 
 Your leads are scored using this exact framework:
