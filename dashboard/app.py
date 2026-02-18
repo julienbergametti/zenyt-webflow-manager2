@@ -18,8 +18,10 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+import secrets as _secrets
+from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 import uvicorn
 import requests
@@ -75,6 +77,93 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Zenyt Lead Dashboard")
 
+# ── Authentication ────────────────────────────────────────────────────────────
+APP_PASSWORD = os.getenv("APP_PASSWORD", "OnyxRock")
+_SESSION_TOKEN = _secrets.token_hex(32)  # generated once per process start
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login – Zenyt</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);height:100vh;display:flex;
+align-items:center;justify-content:center;color:#e2e8f0}
+.card{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:48px 40px;
+width:380px;box-shadow:0 25px 50px rgba(0,0,0,.4)}
+h1{font-size:24px;margin-bottom:8px;text-align:center}
+.sub{color:#94a3b8;text-align:center;margin-bottom:32px;font-size:14px}
+label{display:block;font-size:13px;color:#94a3b8;margin-bottom:6px}
+input{width:100%;padding:12px 16px;border-radius:8px;border:1px solid #334155;
+background:#0f172a;color:#e2e8f0;font-size:15px;outline:none;transition:border .2s}
+input:focus{border-color:#3b82f6}
+button{width:100%;padding:12px;border:none;border-radius:8px;background:#3b82f6;
+color:#fff;font-size:15px;font-weight:600;cursor:pointer;margin-top:24px;transition:background .2s}
+button:hover{background:#2563eb}
+.err{color:#f87171;font-size:13px;margin-top:12px;text-align:center;display:none}
+</style></head>
+<body><div class="card">
+<h1>Zenyt Lead Dashboard</h1>
+<p class="sub">Enter password to continue</p>
+<form method="POST" action="/login">
+<label for="pw">Password</label>
+<input id="pw" name="password" type="password" autocomplete="current-password" autofocus required>
+<button type="submit">Sign in</button>
+</form>
+<p class="err" id="err">Incorrect password. Please try again.</p>
+</div>
+<script>
+if(new URLSearchParams(location.search).get('error')==='1')document.getElementById('err').style.display='block';
+</script>
+</body></html>"""
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    return LOGIN_HTML
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    form = await request.form()
+    password = form.get("password", "")
+    if password == APP_PASSWORD:
+        resp = RedirectResponse(url="/", status_code=302)
+        resp.set_cookie(
+            key="zenyt_session",
+            value=_SESSION_TOKEN,
+            httponly=True,
+            max_age=60 * 60 * 24 * 30,  # 30 days
+            samesite="lax",
+        )
+        return resp
+    return RedirectResponse(url="/login?error=1", status_code=302)
+
+
+@app.get("/logout")
+async def logout():
+    resp = RedirectResponse(url="/login", status_code=302)
+    resp.delete_cookie("zenyt_session")
+    return resp
+
+
+class _AuthMiddleware(BaseHTTPMiddleware):
+    PUBLIC_PATHS = {"/login", "/docs", "/openapi.json", "/api/leads/webhook"}
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path in self.PUBLIC_PATHS or path.startswith("/login"):
+            return await call_next(request)
+        token = request.cookies.get("zenyt_session")
+        if token != _SESSION_TOKEN:
+            return RedirectResponse(url="/login", status_code=302)
+        return await call_next(request)
+
+
+app.add_middleware(_AuthMiddleware)
+# ── End Authentication ────────────────────────────────────────────────────────
+
 # Initialize HubSpot sync globally (optional - works without it)
 hubspot_sync = None
 try:
@@ -128,6 +217,7 @@ def _is_blocked_lead(lead: dict) -> bool:
 def load_leads():
     """Load leads from JSON file - called on every request for real-time sync.
     Returns (pending, pushed, rejected, already_booked).
+    Leads manually marked as test are in the 'test' bucket and excluded here.
     One-time migration: rejected leads with reason containing booked/calendly are moved to already_booked.
     """
     if DATA_FILE.exists():
@@ -140,7 +230,7 @@ def load_leads():
             pushed = data.get('pushed', [])
             rejected = data.get('rejected', [])
             already_booked = data.get('already_booked', [])
-            # Exclude test leads (email or domain contains "test") so they never appear
+            # Exclude auto-detected test leads (email or domain contains "test")
             pending = [l for l in pending if not _is_test_lead(l)]
             pushed = [l for l in pushed if not _is_test_lead(l)]
             rejected = [l for l in rejected if not _is_test_lead(l)]
@@ -169,23 +259,37 @@ def load_leads():
             logger.error(f"Error loading leads: {e}")
     return [], [], [], []
 
-def save_leads(lead_queue, pushed_leads, rejected_leads, already_booked_leads):
-    """Save leads to JSON file (pending, pushed, rejected, already_booked)"""
+def save_leads(lead_queue, pushed_leads, rejected_leads, already_booked_leads, test_leads=None):
+    """Save leads to JSON file (pending, pushed, rejected, already_booked, test).
+    If test_leads is None, the existing test bucket in the file is preserved.
+    """
     try:
-        # Never persist 2025 pending or blocklisted leads so they never reappear
-        lead_queue = [l for l in lead_queue if not _is_2025_lead(l) and not _is_blocked_lead(l)]
-        pushed_leads = [l for l in pushed_leads if not _is_blocked_lead(l)]
-        rejected_leads = [l for l in rejected_leads if not _is_blocked_lead(l)]
-        already_booked_leads = [l for l in already_booked_leads if not _is_blocked_lead(l)]
+        # Never persist 2025 pending, blocklisted, or auto-detected test leads
+        lead_queue = [l for l in lead_queue if not _is_2025_lead(l) and not _is_blocked_lead(l) and not _is_test_lead(l)]
+        pushed_leads = [l for l in pushed_leads if not _is_blocked_lead(l) and not _is_test_lead(l)]
+        rejected_leads = [l for l in rejected_leads if not _is_blocked_lead(l) and not _is_test_lead(l)]
+        already_booked_leads = [l for l in already_booked_leads if not _is_blocked_lead(l) and not _is_test_lead(l)]
+        # Preserve existing test bucket if not explicitly provided
+        if test_leads is None:
+            if DATA_FILE.exists():
+                try:
+                    with open(DATA_FILE, 'r') as f:
+                        existing = json.load(f)
+                    test_leads = existing.get('test', [])
+                except:
+                    test_leads = []
+            else:
+                test_leads = []
         with open(DATA_FILE, 'w') as f:
             json.dump({
                 'pending': lead_queue,
                 'pushed': pushed_leads,
                 'rejected': rejected_leads,
                 'already_booked': already_booked_leads,
+                'test': test_leads,
                 'last_updated': datetime.now().isoformat()
             }, f, indent=2)
-        logger.info(f"Saved {len(lead_queue)} pending, {len(pushed_leads)} pushed, {len(rejected_leads)} rejected, {len(already_booked_leads)} already_booked leads")
+        logger.info(f"Saved {len(lead_queue)} pending, {len(pushed_leads)} pushed, {len(rejected_leads)} rejected, {len(already_booked_leads)} already_booked, {len(test_leads)} test leads")
     except Exception as e:
         logger.error(f"Error saving leads: {e}")
 
@@ -468,17 +572,20 @@ def parse_webflow_submission(submission: Dict, form_name: str) -> Optional[Dict]
         logger.debug(f"Skipping submission - invalid email format: {email}")
         return None
     
-    # Skip test/personal emails
+    # Flag personal/consumer emails but still include them
     email_lower = email.lower()
     email_domain = email.split("@")[1].lower()
     
-    skip_domains = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", 
+    personal_email_domains = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", 
                     "icloud.com", "aol.com", "mail.com", "protonmail.com",
-                    "test.com", "example.com", "mailinator.com"]
+                    "googlemail.com", "ymail.com", "live.com", "me.com"]
+    skip_domains = ["test.com", "example.com", "mailinator.com"]
     skip_patterns = ["test@", "demo@", "fake@", "edu.escp.eu", "student.", ".edu"]
     
+    is_personal_email = email_domain in personal_email_domains
+    
     if email_domain in skip_domains:
-        logger.debug(f"Skipping personal email: {email}")
+        logger.debug(f"Skipping disposable/test email: {email}")
         return None
     
     if any(pattern in email_lower for pattern in skip_patterns):
@@ -515,7 +622,8 @@ def parse_webflow_submission(submission: Dict, form_name: str) -> Optional[Dict]
         "form_name": form_name,
         "created_at": submitted_at,
         "source": "webflow_api",
-        "post_source_auto": post_source_auto
+        "post_source_auto": post_source_auto,
+        "personal_email": is_personal_email
     }
     
     # Apply attribution logic if tracking code exists
@@ -766,11 +874,21 @@ def sync_webflow_leads(days_back: int = 14, enrich: bool = True) -> Dict:
         cutoff_date = datetime.now() - timedelta(days=days_back)
         logger.info(f"First sync - fetching last {days_back} days")
     
-    # Get all existing IDs to avoid duplicates
+    # Get all existing IDs to avoid duplicates (including test bucket)
     existing_webflow_ids = set()
     existing_domains = set()
     
-    for lead in pending + pushed + rejected + already_booked:
+    # Load test leads from raw file so they are included in the duplicate check
+    test_leads_for_dup_check = []
+    if DATA_FILE.exists():
+        try:
+            with open(DATA_FILE, 'r') as f:
+                raw_data = json.load(f)
+            test_leads_for_dup_check = raw_data.get('test', [])
+        except:
+            pass
+    
+    for lead in pending + pushed + rejected + already_booked + test_leads_for_dup_check:
         if lead.get("webflow_id"):
             existing_webflow_ids.add(lead["webflow_id"])
         if lead.get("domain"):
@@ -1091,6 +1209,35 @@ DASHBOARD_HTML = """
             background: rgba(10, 102, 194, 0.1);
         }
         
+        .btn-linkedin-find {
+            display: inline-flex; align-items: center; gap: 4px;
+            background: none; border: 1px solid #0a66c2; color: #0a66c2;
+            border-radius: 4px; padding: 1px 6px; font-size: 0.7rem;
+            cursor: pointer; margin-left: 8px; transition: all 0.2s;
+            vertical-align: middle; font-weight: 600;
+        }
+        .btn-linkedin-find:hover { background: rgba(10, 102, 194, 0.15); }
+        .btn-linkedin-find.loading { opacity: 0.6; cursor: wait; }
+        .linkedin-profile-link {
+            color: #0a66c2; margin-left: 8px; font-size: 0.8rem;
+            font-weight: 600; text-decoration: none;
+        }
+        .linkedin-profile-link:hover { text-decoration: underline; }
+        .linkedin-manual-input {
+            display: inline-flex; align-items: center; gap: 4px;
+            margin-left: 8px; font-size: 0.75rem;
+        }
+        .linkedin-manual-input input {
+            background: var(--bg-hover); border: 1px solid var(--border-subtle);
+            color: var(--text-primary); border-radius: 4px; padding: 2px 6px;
+            font-size: 0.75rem; width: 200px;
+        }
+        .linkedin-manual-input button {
+            background: #0a66c2; color: white; border: none;
+            border-radius: 4px; padding: 2px 8px; font-size: 0.7rem;
+            cursor: pointer; font-weight: 600;
+        }
+        
         .lead-grid { display: grid; gap: 0.75rem; }
         
         .lead-card {
@@ -1400,6 +1547,7 @@ DASHBOARD_HTML = """
                 <button class="tab" data-tab="pushed">✅ Pushed</button>
                 <button class="tab rejected-tab" data-tab="rejected">❌ Rejected</button>
                 <button class="tab already-booked-tab" data-tab="already_booked">📅 Already booked</button>
+                <button class="tab" data-tab="tested" style="font-size: 0.8rem;">🧪 Tested</button>
                 <button class="tab" data-tab="analytics" style="margin-left: auto; background: linear-gradient(135deg, #3b82f6, #2563eb); color: white;">📈 Analytics</button>
                 <button class="tab" data-tab="post-performance" style="background: linear-gradient(135deg, #6a5b95, #8b7cb5); color: white;">📊 Post Performance</button>
             </div>
@@ -1605,6 +1753,10 @@ DASHBOARD_HTML = """
                         <input type="text" id="push-contact-lastname">
                     </div>
                     <div class="preview-field">
+                        <label>LinkedIn Profile URL</label>
+                        <input type="text" id="push-linkedin-url" placeholder="https://linkedin.com/in/...">
+                    </div>
+                    <div class="preview-field">
                         <label>Contact Owner</label>
                         <select id="push-contact-owner">
                             <option value="">-- No Owner --</option>
@@ -1628,17 +1780,64 @@ DASHBOARD_HTML = """
         </div>
     </div>
     
+    <!-- Email Draft Preview Modal -->
+    <div class="modal-overlay" id="email-draft-modal">
+        <div class="modal" style="max-width: 850px;">
+            <h3 style="margin-bottom: 0.25rem;">📧 Pre-Call Email Draft</h3>
+            <p style="color: var(--text-secondary); margin-bottom: 1.25rem; font-size: 0.85rem;">
+                Generated from the push data. Copy or use Cursor to create a draft via Microsoft MCP.
+            </p>
+            
+            <div class="preview-section" style="margin-bottom: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <div>
+                        <strong style="color: var(--text-secondary); font-size: 0.8rem;">To:</strong>
+                        <span id="draft-to" style="font-size: 0.85rem;"></span>
+                    </div>
+                    <span id="draft-word-count" style="font-size: 0.75rem; color: var(--text-muted);"></span>
+                </div>
+                <div style="margin-bottom: 0.75rem;">
+                    <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.25rem;">
+                        <strong style="color: var(--text-secondary); font-size: 0.8rem;">Subject:</strong>
+                        <span id="draft-subject" style="font-size: 0.85rem; font-weight: 600;"></span>
+                        <button onclick="copyToClipboard(document.getElementById('draft-subject').textContent, 'Subject')" style="background:none;border:1px solid var(--border-subtle);color:var(--text-secondary);border-radius:4px;padding:1px 6px;font-size:0.7rem;cursor:pointer;">Copy</button>
+                    </div>
+                </div>
+                <div style="position: relative;">
+                    <pre id="draft-body" style="background: var(--bg-hover); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 1rem; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.85rem; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; max-height: 350px; overflow-y: auto; color: var(--text-primary);"></pre>
+                    <button onclick="copyToClipboard(document.getElementById('draft-body').textContent, 'Email body')" style="position:absolute;top:8px;right:8px;background:var(--bg-card);border:1px solid var(--border-subtle);color:var(--text-secondary);border-radius:4px;padding:3px 10px;font-size:0.75rem;cursor:pointer;font-weight:600;">Copy Body</button>
+                </div>
+            </div>
+            
+            <div id="draft-linkedin-section" class="preview-section" style="margin-bottom: 1rem; display:none;">
+                <h4 style="font-size: 0.9rem; color: #0a66c2; margin-bottom: 0.5rem;">LinkedIn Connection Request</h4>
+                <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;" id="draft-linkedin-link-row">
+                </div>
+                <div style="position: relative;">
+                    <pre id="draft-linkedin-msg" style="background: var(--bg-hover); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 0.75rem; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.85rem; line-height: 1.4; white-space: pre-wrap; color: var(--text-primary);"></pre>
+                    <button onclick="copyToClipboard(document.getElementById('draft-linkedin-msg').textContent, 'LinkedIn message')" style="position:absolute;top:6px;right:6px;background:var(--bg-card);border:1px solid var(--border-subtle);color:var(--text-secondary);border-radius:4px;padding:2px 8px;font-size:0.7rem;cursor:pointer;">Copy</button>
+                </div>
+            </div>
+            
+            <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end;">
+                <a id="draft-mailto-link" href="#" style="display:inline-flex;align-items:center;gap:4px;padding:8px 16px;background:var(--bg-hover);border:1px solid var(--border-subtle);border-radius:8px;color:var(--text-primary);text-decoration:none;font-size:0.85rem;font-weight:500;">📨 Open in Mail App</a>
+                <button class="btn btn-secondary" onclick="closeEmailDraftModal()">Close</button>
+            </div>
+        </div>
+    </div>
+    
     <div class="toast" id="toast">
         <span id="toast-icon">✅</span>
         <span id="toast-message">Success!</span>
     </div>
     
     <script>
-        let leads = { pending: [], pushed: [], rejected: [], already_booked: [] };
+        let leads = { pending: [], pushed: [], rejected: [], already_booked: [], tested: [] };
         let currentTab = 'new';  // Default to "New Today" view
         let currentSort = 'date-desc';
         let rejectingLeadId = null;
         let pushingLeadId = null;
+        let pushAlreadyBookedMode = false;
         let alreadyBookingLeadId = null;
         let hubspotCache = {};
         
@@ -1885,7 +2084,8 @@ DASHBOARD_HTML = """
             return '';
         }
         
-        document.getElementById('add-lead-form').addEventListener('submit', async (e) => {
+        const _addLeadForm = document.getElementById('add-lead-form');
+        if (_addLeadForm) _addLeadForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const formData = new FormData(e.target);
             const data = {
@@ -1936,8 +2136,9 @@ DASHBOARD_HTML = """
             return name.charAt(0).toUpperCase() + name.slice(1);
         }
         
-        function openPushModal(leadId) {
+        function openPushModal(leadId, alreadyBookedMode = false) {
             pushingLeadId = leadId;
+            pushAlreadyBookedMode = alreadyBookedMode;
             const lead = leads.pending.find(l => l.id === leadId);
             if (!lead) return;
             
@@ -1977,6 +2178,7 @@ DASHBOARD_HTML = """
             document.getElementById('push-contact-email').value = lead.email || '';
             document.getElementById('push-contact-firstname').value = firstName;
             document.getElementById('push-contact-lastname').value = lastName;
+            document.getElementById('push-linkedin-url').value = lead.linkedin_profile_url || '';
             
             // Reset other fields to defaults
             document.getElementById('push-company-owner').value = '';
@@ -1984,11 +2186,31 @@ DASHBOARD_HTML = """
             document.getElementById('push-demo-request').value = 'true';
             document.getElementById('push-ai-status').value = 'To Do';
             
+            // Update modal title and button based on mode
+            const modalTitle = document.querySelector('#push-modal .modal h3');
+            const confirmBtn = document.getElementById('confirm-push-btn');
+            if (alreadyBookedMode) {
+                modalTitle.innerHTML = '📅 Already Booked &mdash; Push to HubSpot';
+                confirmBtn.innerHTML = '<span>📅</span> Push & Mark as Booked';
+                confirmBtn.style.background = '#0ea5e9';
+            } else {
+                modalTitle.innerHTML = '🚀 Push to HubSpot - Preview & Edit';
+                confirmBtn.innerHTML = '<span>🚀</span> Push to HubSpot';
+                confirmBtn.style.background = '';
+            }
+            
             document.getElementById('push-modal').classList.add('show');
         }
         
         function closePushModal() {
             pushingLeadId = null;
+            pushAlreadyBookedMode = false;
+            // Reset modal title and button to defaults
+            const modalTitle = document.querySelector('#push-modal .modal h3');
+            const confirmBtn = document.getElementById('confirm-push-btn');
+            modalTitle.innerHTML = '🚀 Push to HubSpot - Preview & Edit';
+            confirmBtn.innerHTML = '<span>🚀</span> Push to HubSpot';
+            confirmBtn.style.background = '';
             document.getElementById('push-modal').classList.remove('show');
         }
         
@@ -1996,8 +2218,11 @@ DASHBOARD_HTML = """
             if (!pushingLeadId) return;
             
             const btn = document.getElementById('confirm-push-btn');
+            const isBookedMode = pushAlreadyBookedMode;
             btn.disabled = true;
-            btn.innerHTML = '<span class="loading">⏳</span> Pushing...';
+            btn.innerHTML = isBookedMode 
+                ? '<span class="loading">⏳</span> Pushing & booking...'
+                : '<span class="loading">⏳</span> Pushing...';
             
             const pushData = {
                 company_domain: document.getElementById('push-company-domain').value,
@@ -2009,7 +2234,9 @@ DASHBOARD_HTML = """
                 contact_email: document.getElementById('push-contact-email').value,
                 contact_firstname: document.getElementById('push-contact-firstname').value,
                 contact_lastname: document.getElementById('push-contact-lastname').value,
-                contact_owner: document.getElementById('push-contact-owner').value
+                contact_owner: document.getElementById('push-contact-owner').value,
+                linkedin_url: document.getElementById('push-linkedin-url').value,
+                already_booked: isBookedMode
             };
             
             try {
@@ -2021,9 +2248,17 @@ DASHBOARD_HTML = """
                 
                 if (response.ok) {
                     const result = await response.json();
-                    showToast(`Pushed to HubSpot! Company: ${result.company_id}`, 'success');
+                    if (result.already_booked) {
+                        showToast(`Pushed to HubSpot & marked as already booked!`, 'success');
+                    } else {
+                        showToast(`Pushed to HubSpot! Company: ${result.company_id}`, 'success');
+                    }
                     closePushModal();
                     await loadLeads();
+                    
+                    if (result.email_draft) {
+                        showEmailDraftModal(result.email_draft);
+                    }
                 } else {
                     const error = await response.json();
                     showToast(error.detail || 'Error pushing to HubSpot', 'error');
@@ -2032,7 +2267,11 @@ DASHBOARD_HTML = """
                 showToast('Error: ' + err.message, 'error');
             } finally {
                 btn.disabled = false;
-                btn.innerHTML = '<span>🚀</span> Push to HubSpot';
+                if (isBookedMode) {
+                    btn.innerHTML = '<span>📅</span> Push & Mark as Booked';
+                } else {
+                    btn.innerHTML = '<span>🚀</span> Push to HubSpot';
+                }
             }
         }
         
@@ -2070,26 +2309,106 @@ DASHBOARD_HTML = """
             }
         }
         
-        async function markLeadAlreadyBooked(leadId) {
-            const reason = 'Meeting in Calendly';
+        async function markLeadAsTest(leadId) {
             try {
-                const response = await fetch(`/api/leads/${leadId}/already-booked`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ reason: reason })
-                });
+                const response = await fetch(`/api/leads/${leadId}/test`, { method: 'POST' });
                 if (response.ok) {
-                    showToast('Lead marked as already booked', 'success');
+                    showToast('Lead marked as test', 'success');
                     await loadLeads();
                 } else {
-                    const err = await response.json();
-                    showToast(err.detail || 'Error', 'error');
+                    const data = await response.json();
+                    showToast(data.detail || 'Error marking lead as test', 'error');
                 }
             } catch (err) {
                 showToast('Error: ' + err.message, 'error');
             }
         }
         
+        async function markLeadAlreadyBooked(leadId) {
+            const reason = 'Meeting in Calendly';
+            try {
+                showToast('Checking HubSpot...', 'info');
+                const response = await fetch(`/api/leads/${leadId}/already-booked`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ reason: reason })
+                });
+                const result = await response.json();
+                
+                if (result.needs_push) {
+                    // Contact not in HubSpot yet: open push modal in already_booked mode
+                    showToast('Contact not in HubSpot yet. Fill in details to create it.', 'info');
+                    openPushModal(leadId, true);
+                    return;
+                }
+                
+                if (result.success) {
+                    if (result.hubspot_synced) {
+                        showToast('Already booked + HubSpot updated (calendly & tracking)', 'success');
+                    } else {
+                        showToast('Lead marked as already booked', 'success');
+                    }
+                    await loadLeads();
+                } else {
+                    showToast(result.detail || 'Error', 'error');
+                }
+            } catch (err) {
+                showToast('Error: ' + err.message, 'error');
+            }
+        }
+        
+        // LinkedIn profile finder
+        async function findLinkedIn(leadId) {
+            const wrapper = document.getElementById('li-btn-' + leadId);
+            if (!wrapper) return;
+            wrapper.innerHTML = '<span class="btn-linkedin-find loading">searching...</span>';
+
+            try {
+                const resp = await fetch('/api/leads/' + leadId + '/find-linkedin', { method: 'POST' });
+                const data = await resp.json();
+
+                if (data.linkedin_url) {
+                    wrapper.innerHTML = '<a href="' + data.linkedin_url + '" target="_blank" class="linkedin-profile-link" title="LinkedIn Profile">in</a>';
+                    showToast('LinkedIn found' + (data.person_title ? ' (' + data.person_title + ')' : ''), 'success');
+                } else {
+                    wrapper.innerHTML =
+                        '<span class="linkedin-manual-input">' +
+                        '<input type="text" id="li-input-' + leadId + '" placeholder="Paste LinkedIn URL">' +
+                        '<button onclick="saveLinkedIn(\\'' + leadId + '\\')">Save</button>' +
+                        ' <a href="' + data.search_links.google + '" target="_blank" style="color:#0a66c2;font-size:0.7rem;">Google</a>' +
+                        ' <a href="' + data.search_links.linkedin + '" target="_blank" style="color:#0a66c2;font-size:0.7rem;">LI</a>' +
+                        '</span>';
+                    showToast('Not found automatically. Paste URL or use search links.', 'info');
+                }
+            } catch (err) {
+                wrapper.innerHTML = '<button class="btn-linkedin-find" onclick="findLinkedIn(\\'' + leadId + '\\')">in?</button>';
+                showToast('LinkedIn search error: ' + err.message, 'error');
+            }
+        }
+
+        async function saveLinkedIn(leadId) {
+            const input = document.getElementById('li-input-' + leadId);
+            const url = (input && input.value || '').trim();
+            if (!url) { showToast('Please paste a LinkedIn URL', 'error'); return; }
+
+            try {
+                const resp = await fetch('/api/leads/' + leadId + '/save-linkedin', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ linkedin_url: url })
+                });
+                if (resp.ok) {
+                    const wrapper = document.getElementById('li-btn-' + leadId);
+                    wrapper.innerHTML = '<a href="' + url + '" target="_blank" class="linkedin-profile-link" title="LinkedIn Profile">in</a>';
+                    showToast('LinkedIn URL saved', 'success');
+                } else {
+                    showToast('Failed to save', 'error');
+                }
+            } catch (err) {
+                showToast('Error: ' + err.message, 'error');
+            }
+        }
+
         // Re-enrich a lead with Apollo API
         async function reEnrichLead(leadId) {
             const button = event.target;
@@ -2154,6 +2473,8 @@ DASHBOARD_HTML = """
                 currentLeads = leads.rejected;
             } else if (currentTab === 'already_booked') {
                 currentLeads = leads.already_booked;
+            } else if (currentTab === 'tested') {
+                currentLeads = leads.tested || [];
             }
             
             currentLeads = sortLeads(currentLeads);
@@ -2172,7 +2493,8 @@ DASHBOARD_HTML = """
                     pending: { title: 'No pending leads', desc: 'Add a lead above or wait for Webflow form submissions' },
                     pushed: { title: 'No pushed leads yet', desc: 'Push some leads to see them here' },
                     rejected: { title: 'No rejected leads', desc: 'Rejected leads will appear here for reference' },
-                    already_booked: { title: 'No already booked leads', desc: 'Leads marked as already booked (e.g. meeting in Calendly) will appear here' }
+                    already_booked: { title: 'No already booked leads', desc: 'Leads marked as already booked (e.g. meeting in Calendly) will appear here' },
+                    tested: { title: 'No tested leads', desc: 'Leads you mark as test will appear here' }
                 };
                 container.innerHTML = `
                     <div class="empty-state">
@@ -2188,18 +2510,27 @@ DASHBOARD_HTML = """
                 const isRejected = currentTab === 'rejected';
                 const isPushed = currentTab === 'pushed';
                 const isAlreadyBooked = currentTab === 'already_booked';
+                const isTested = currentTab === 'tested';
                 const hsStatus = hubspotCache[lead.id];
                 
                 return `
-                <div class="lead-card priority-${priorityClass} ${isRejected ? 'rejected-card' : ''} ${isAlreadyBooked ? 'already-booked-card' : ''}" data-lead-id="${lead.id}">
+                <div class="lead-card priority-${priorityClass} ${isRejected ? 'rejected-card' : ''} ${isAlreadyBooked ? 'already-booked-card' : ''} ${isTested ? 'rejected-card' : ''}" data-lead-id="${lead.id}">
                     <div class="lead-header">
                         <div class="lead-info">
                             <h3>${lead.company_name || lead.website}</h3>
-                            <div class="email">${lead.email}</div>
+                            <div class="email">
+                                ${lead.email}
+                                <span id="li-btn-${lead.id}">
+                                ${lead.linkedin_profile_url
+                                    ? `<a href="${lead.linkedin_profile_url}" target="_blank" class="linkedin-profile-link" title="LinkedIn Profile">in</a>`
+                                    : `<button class="btn-linkedin-find" onclick="findLinkedIn('${lead.id}')" title="Find LinkedIn profile">in?</button>`}
+                                </span>
+                            </div>
                             <div class="lead-date">📅 ${formatDate(lead.created_at)}</div>
                         </div>
                         <div class="lead-badges">
                             <span class="badge priority priority-${priorityClass}">${lead.priority}</span>
+                            ${lead.personal_email ? '<span class="badge" style="background: #f97316; color: white;">📧 Personal Email</span>' : ''}
                             ${lead.apollo_enriched ? '<span class="badge apollo">✨ Apollo Verified</span>' : ''}
                             ${lead.is_agency ? '<span class="badge agency">🏢 Agency</span>' : '<span class="badge ecommerce">🛒 E-commerce</span>'}
                             ${lead.has_meeting ? '<span class="badge meeting">📅 Meeting</span>' : ''}
@@ -2344,11 +2675,12 @@ DASHBOARD_HTML = """
                         </div>
                     ` : ''}
                     
-                    ${!isRejected && !isPushed && !isAlreadyBooked ? `
+                    ${!isRejected && !isPushed && !isAlreadyBooked && !isTested ? `
                         <div class="lead-actions">
                             <button class="btn btn-danger" onclick="openRejectModal('${lead.id}')">
                                 <span>✕</span> Reject
                             </button>
+                            <button class="btn btn-secondary" onclick="markLeadAsTest('${lead.id}')">Test</button>
                             <button class="btn" onclick="markLeadAlreadyBooked('${lead.id}')" style="background: #0ea5e9; color: white; border: none;">
                                 <span>📅</span> Already booked
                             </button>
@@ -2422,7 +2754,8 @@ DASHBOARD_HTML = """
                         pending: data.pending || [],
                         pushed: data.pushed || [],
                         rejected: data.rejected || [],
-                        already_booked: data.already_booked || []
+                        already_booked: data.already_booked || [],
+                        tested: data.tested || []
                     };
                     const newCount = leads.pending.length;
                     
@@ -2864,10 +3197,52 @@ DASHBOARD_HTML = """
         
         function showToast(message, type = 'success') {
             const toast = document.getElementById('toast');
-            document.getElementById('toast-icon').textContent = type === 'success' ? '✅' : '❌';
+            document.getElementById('toast-icon').textContent = type === 'success' ? '✅' : type === 'info' ? 'ℹ️' : '❌';
             document.getElementById('toast-message').textContent = message;
             toast.className = `toast show ${type}`;
             setTimeout(() => toast.classList.remove('show'), 3000);
+        }
+        
+        function copyToClipboard(text, label) {
+            navigator.clipboard.writeText(text).then(() => {
+                showToast(label + ' copied to clipboard', 'success');
+            }).catch(() => {
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                showToast(label + ' copied', 'success');
+            });
+        }
+        
+        function showEmailDraftModal(draft) {
+            document.getElementById('draft-to').textContent = draft.to || '';
+            document.getElementById('draft-subject').textContent = draft.subject || '';
+            document.getElementById('draft-body').textContent = draft.body || '';
+            document.getElementById('draft-word-count').textContent = draft.word_count ? '~' + draft.word_count + ' words' : '';
+            document.getElementById('draft-mailto-link').href = draft.mailto_link || '#';
+            
+            const liSection = document.getElementById('draft-linkedin-section');
+            if (draft.linkedin_message) {
+                liSection.style.display = 'block';
+                document.getElementById('draft-linkedin-msg').textContent = draft.linkedin_message;
+                const linkRow = document.getElementById('draft-linkedin-link-row');
+                if (draft.linkedin_url) {
+                    linkRow.innerHTML = '<a href="' + draft.linkedin_url + '" target="_blank" style="color:#0a66c2;font-weight:600;font-size:0.85rem;">Open LinkedIn Profile →</a>';
+                } else {
+                    linkRow.innerHTML = '<span style="color:var(--text-muted);font-size:0.8rem;">No LinkedIn URL found. Search manually before sending.</span>';
+                }
+            } else {
+                liSection.style.display = 'none';
+            }
+            
+            document.getElementById('email-draft-modal').classList.add('show');
+        }
+        
+        function closeEmailDraftModal() {
+            document.getElementById('email-draft-modal').classList.remove('show');
         }
         
         async function loadLeads() {
@@ -2879,7 +3254,8 @@ DASHBOARD_HTML = """
                         pending: data.pending || [],
                         pushed: data.pushed || [],
                         rejected: data.rejected || [],
-                        already_booked: data.already_booked || []
+                        already_booked: data.already_booked || [],
+                        tested: data.tested || []
                     };
                     renderLeads();
                 }
@@ -2908,11 +3284,21 @@ async def dashboard():
 async def get_leads():
     """Get all leads - always reload from file for real-time sync"""
     lead_queue, pushed_leads, rejected_leads, already_booked_leads = load_leads()
+    # Load test leads directly from file (separate bucket, not in load_leads)
+    tested_leads = []
+    if DATA_FILE.exists():
+        try:
+            with open(DATA_FILE, 'r') as f:
+                raw = json.load(f)
+            tested_leads = raw.get('test', [])
+        except:
+            pass
     return {
         "pending": lead_queue,
         "pushed": pushed_leads,
         "rejected": rejected_leads,
-        "already_booked": already_booked_leads
+        "already_booked": already_booked_leads,
+        "tested": tested_leads
     }
 
 
@@ -2930,12 +3316,21 @@ async def reload_leads(enrich: bool = True):
     
     # Load the updated leads
     lead_queue, pushed_leads, rejected_leads, already_booked_leads = load_leads()
+    tested_leads = []
+    if DATA_FILE.exists():
+        try:
+            with open(DATA_FILE, 'r') as f:
+                raw = json.load(f)
+            tested_leads = raw.get('test', [])
+        except:
+            pass
     
     return {
         "pending": lead_queue,
         "pushed": pushed_leads,
         "rejected": rejected_leads,
         "already_booked": already_booked_leads,
+        "tested": tested_leads,
         "sync_result": sync_result
     }
 
@@ -3205,6 +3600,12 @@ async def push_to_hubspot(lead_id: str, request: Request):
         if contact_owner:
             contact_props['hubspot_owner_id'] = contact_owner
         
+        # Add LinkedIn profile URL if available
+        linkedin_url = push_data.get('linkedin_url', '').strip()
+        if linkedin_url:
+            contact_props['linkedin'] = linkedin_url
+            lead['linkedin_profile_url'] = linkedin_url
+        
         # Add LinkedIn post tracking properties if available
         if lead.get('post_source_auto'):
             contact_props['linkedin_post_source'] = lead.get('post_source_auto')
@@ -3214,6 +3615,12 @@ async def push_to_hubspot(lead_id: str, request: Request):
             contact_props['linkedin_post_date'] = lead.get('post_date')
         if lead.get('post_track'):
             contact_props['linkedin_post_track'] = lead.get('post_track')
+        
+        # If pushing in already_booked mode, add calendly property
+        is_already_booked_push = push_data.get('already_booked', False)
+        if is_already_booked_push:
+            contact_props['calendly'] = 'yes'
+            logger.info("Already-booked push mode: adding calendly=yes to contact properties")
         
         logger.info(f"Creating contact with properties: {contact_props}")
         
@@ -3232,38 +3639,35 @@ async def push_to_hubspot(lead_id: str, request: Request):
             contact_manager.update(contact_id, {'hubspot_owner_id': contact_owner})
             logger.info(f"Updated contact {contact_id} with owner: {contact_owner}")
         
-        # Update lead with pushed info
-        lead['status'] = 'pushed'
+        # Update lead with HubSpot info
         lead['hubspot_company_id'] = company_id
         lead['hubspot_contact_id'] = contact_id
         lead['company_name'] = push_data.get('company_name') or lead.get('company_name')
         lead['priority'] = push_data.get('priority', lead['priority'])
         
+        # Move lead to the appropriate bucket
         lead_queue.remove(lead)
-        pushed_leads.append(lead)
+        if is_already_booked_push:
+            lead['status'] = 'already_booked'
+            lead['already_booked_at'] = datetime.now().isoformat()
+            lead['already_booked_reason'] = 'Meeting in Calendly'
+            already_booked_leads.append(lead)
+            logger.info(f"Lead {lead_id} pushed to HubSpot and moved to already_booked")
+        else:
+            lead['status'] = 'pushed'
+            pushed_leads.append(lead)
         save_leads(lead_queue, pushed_leads, rejected_leads, already_booked_leads)
         
-        # Auto-generate demo request email and prospect files if this is a demo request
-        prospect_created = False
-        if is_demo_request(lead) and PROSPECT_GENERATION_AVAILABLE:
+        # Always generate the email draft for demo requests
+        contact_email = push_data.get('contact_email') or lead.get('email', '')
+        contact_firstname = push_data.get('contact_firstname') or lead.get('firstname', '')
+        contact_lastname = push_data.get('contact_lastname') or lead.get('lastname', '')
+        website_url = push_data.get('company_domain') or lead.get('website') or lead.get('domain', '')
+        industry = lead.get('industry') or company_props.get('industry')
+        
+        email_data = None
+        if generate_demo_request_email:
             try:
-                # Get settings for paths
-                try:
-                    settings = get_settings()
-                    prospects_base_path = settings.prospect.prospects_base_path
-                except Exception:
-                    # Fallback path if settings not available
-                    workspace_root = Path(__file__).parent.parent.parent.parent
-                    prospects_base_path = workspace_root / "zenyt_sales" / "prospects"
-                
-                # Get contact and company info
-                contact_email = push_data.get('contact_email') or lead.get('email', '')
-                contact_firstname = push_data.get('contact_firstname') or lead.get('firstname', '')
-                contact_lastname = push_data.get('contact_lastname') or lead.get('lastname', '')
-                website_url = push_data.get('company_domain') or lead.get('website') or lead.get('domain', '')
-                industry = lead.get('industry') or company_props.get('industry')
-                
-                # Generate email
                 email_data = generate_demo_request_email(
                     contact_email=contact_email,
                     contact_firstname=contact_firstname,
@@ -3271,16 +3675,29 @@ async def push_to_hubspot(lead_id: str, request: Request):
                     company_name=company_name,
                     website_url=website_url,
                     industry=industry,
-                    company_country=None  # Could be added from Apollo data
+                    company_country=None,
+                    scan_url=lead.get('website') or lead.get('domain', ''),
+                    linkedin_url=linkedin_url or lead.get('linkedin_profile_url'),
                 )
+            except Exception as e:
+                logger.error(f"Email generation failed: {e}", exc_info=True)
+        
+        # Auto-generate prospect files if this is a demo request
+        prospect_created = False
+        if is_demo_request(lead) and PROSPECT_GENERATION_AVAILABLE and email_data:
+            try:
+                try:
+                    settings = get_settings()
+                    prospects_base_path = settings.prospect.prospects_base_path
+                except Exception:
+                    workspace_root = Path(__file__).parent.parent.parent.parent
+                    prospects_base_path = workspace_root / "zenyt_sales" / "prospects"
                 
-                # Create prospect folder
                 prospect_folder = create_prospect_folder(
                     prospects_base_path=prospects_base_path,
                     company_name=company_name
                 )
                 
-                # Create campaign overview
                 contact_full_name = f"{contact_firstname} {contact_lastname}".strip() or contact_email.split('@')[0]
                 create_campaign_overview(
                     folder_path=prospect_folder,
@@ -3294,7 +3711,6 @@ async def push_to_hubspot(lead_id: str, request: Request):
                     agency_name=email_data.get('agency_name')
                 )
                 
-                # Create touch 1 file
                 create_touch_1_file(
                     folder_path=prospect_folder,
                     contact_firstname=contact_firstname,
@@ -3312,17 +3728,29 @@ async def push_to_hubspot(lead_id: str, request: Request):
                 
             except Exception as e:
                 logger.error(f"Failed to create prospect files: {e}", exc_info=True)
-                # Don't fail the push if prospect creation fails
         
         response_data = {
             "success": True,
             "company_id": company_id,
             "contact_id": contact_id,
-            "prospect_created": prospect_created
+            "prospect_created": prospect_created,
+            "already_booked": is_already_booked_push
         }
         
         if prospect_created:
             response_data["prospect_folder"] = str(prospect_folder)
+        
+        if email_data:
+            response_data["email_draft"] = {
+                "to": email_data.get("to", contact_email),
+                "subject": email_data.get("subject", ""),
+                "body": email_data.get("body", ""),
+                "mailto_link": email_data.get("mailto_link", ""),
+                "linkedin_message": email_data.get("linkedin_message", ""),
+                "linkedin_url": email_data.get("linkedin_url", ""),
+                "word_count": email_data.get("word_count", 0),
+                "is_agency": email_data.get("is_agency", False),
+            }
         
         return response_data
         
@@ -3330,6 +3758,117 @@ async def push_to_hubspot(lead_id: str, request: Request):
         raise
     except Exception as e:
         logger.error(f"Error pushing to HubSpot: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/leads/{lead_id}/find-linkedin")
+async def find_linkedin_profile(lead_id: str):
+    """Auto-find the prospect's personal LinkedIn profile using Apollo People Match."""
+    lead_queue, pushed_leads, rejected_leads, already_booked_leads = load_leads()
+    all_leads = lead_queue + pushed_leads + rejected_leads + already_booked_leads
+    lead = next((l for l in all_leads if l['id'] == lead_id), None)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    enricher = ApolloEnricher()
+    if not enricher.api_key:
+        raise HTTPException(status_code=503, detail="Apollo API key not configured")
+
+    first_name, last_name = '', ''
+    if lead.get('full_name'):
+        parts = lead['full_name'].split(' ', 1)
+        first_name = parts[0]
+        last_name = parts[1] if len(parts) > 1 else ''
+
+    email = lead.get('email')
+    company = lead.get('company_name') or ''
+    domain = lead.get('domain') or lead.get('website') or ''
+
+    person = enricher.enrich_person(
+        email=email,
+        first_name=first_name,
+        last_name=last_name,
+        organization_name=company,
+        domain=domain,
+    )
+
+    linkedin_url = person.linkedin_url if person else None
+
+    if linkedin_url:
+        lead['linkedin_profile_url'] = linkedin_url
+        save_leads(
+            [l for l in lead_queue],
+            pushed_leads,
+            rejected_leads,
+            already_booked_leads,
+        )
+        logger.info(f"Found LinkedIn for {lead_id}: {linkedin_url}")
+
+    search_name = f"{first_name} {last_name}".strip() or email
+    return {
+        "linkedin_url": linkedin_url,
+        "person_title": person.title if person else None,
+        "search_links": {
+            "google": f"https://www.google.com/search?q=site%3Alinkedin.com%2Fin+%22{search_name}%22+%22{company}%22",
+            "linkedin": f"https://www.linkedin.com/search/results/people/?keywords={search_name} {company}",
+        },
+    }
+
+
+@app.post("/api/leads/{lead_id}/save-linkedin")
+async def save_linkedin_profile(lead_id: str, request: Request):
+    """Manually save a prospect's LinkedIn profile URL."""
+    body = await request.json()
+    url = (body.get('linkedin_url') or '').strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="linkedin_url is required")
+
+    lead_queue, pushed_leads, rejected_leads, already_booked_leads = load_leads()
+    all_leads = lead_queue + pushed_leads + rejected_leads + already_booked_leads
+    lead = next((l for l in all_leads if l['id'] == lead_id), None)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    lead['linkedin_profile_url'] = url
+    save_leads(lead_queue, pushed_leads, rejected_leads, already_booked_leads)
+    logger.info(f"Saved LinkedIn URL for {lead_id}: {url}")
+    return {"success": True, "linkedin_url": url}
+
+
+@app.post("/api/leads/{lead_id}/test")
+async def mark_lead_as_test(lead_id: str):
+    """Mark a specific pending lead as test. Moves it to the test bucket (excluded from all stats)."""
+    try:
+        # Read raw file to access the test bucket
+        if not DATA_FILE.exists():
+            raise HTTPException(status_code=404, detail="No data file")
+        with open(DATA_FILE, 'r') as f:
+            data = json.load(f)
+        test_leads = data.get('test', [])
+
+        # Load filtered pending
+        lead_queue, pushed_leads, rejected_leads, already_booked_leads = load_leads()
+
+        lead = None
+        for l in lead_queue:
+            if l['id'] == lead_id:
+                lead = l
+                break
+
+        if not lead:
+            raise HTTPException(status_code=404, detail="Lead not found in pending")
+
+        lead['status'] = 'test'
+        lead['tested_at'] = datetime.now().isoformat()
+        lead_queue.remove(lead)
+        test_leads.append(lead)
+        save_leads(lead_queue, pushed_leads, rejected_leads, already_booked_leads, test_leads=test_leads)
+        logger.info(f"Marked lead {lead.get('email')} as test")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error marking lead as test: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3363,7 +3902,13 @@ async def reject_lead(lead_id: str, request: Request):
 
 @app.post("/api/leads/{lead_id}/already-booked")
 async def mark_lead_already_booked(lead_id: str, request: Request):
-    """Mark a pending lead as already booked (meeting in Calendly etc.)"""
+    """Mark a pending lead as already booked (meeting in Calendly etc.)
+    
+    If the contact already exists in HubSpot, updates it with calendly=yes
+    and LinkedIn post source tracking properties, then moves to already_booked.
+    If the contact does NOT exist in HubSpot, returns needs_push=True so the
+    frontend can open the push modal in already_booked mode.
+    """
     try:
         data = await request.json()
     except Exception:
@@ -3381,6 +3926,52 @@ async def mark_lead_already_booked(lead_id: str, request: Request):
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     
+    # Check HubSpot for existing contact and update if found
+    hubspot_synced = False
+    hubspot_message = ""
+    
+    if HUBSPOT_AVAILABLE and lead.get('email'):
+        try:
+            contact_manager = ContactManager()
+            contact = contact_manager.find_by_email(lead['email'])
+            
+            if contact:
+                # Contact exists in HubSpot: update with calendly + tracking properties
+                contact_id = contact.get('id')
+                update_props = {'calendly': 'yes'}
+                
+                if lead.get('post_source_auto'):
+                    update_props['linkedin_post_source'] = lead.get('post_source_auto')
+                if lead.get('post_creator'):
+                    update_props['linkedin_post_creator'] = lead.get('post_creator')
+                if lead.get('post_date'):
+                    update_props['linkedin_post_date'] = lead.get('post_date')
+                if lead.get('post_track'):
+                    update_props['linkedin_post_track'] = lead.get('post_track')
+                
+                logger.info(f"Updating HubSpot contact {contact_id} with already-booked props: {update_props}")
+                result = contact_manager.update(contact_id, update_props)
+                if result:
+                    hubspot_synced = True
+                    hubspot_message = f"Contact {contact_id} updated in HubSpot (calendly + tracking)"
+                    logger.info(hubspot_message)
+                else:
+                    hubspot_message = "Failed to update contact in HubSpot"
+                    logger.error(hubspot_message)
+            else:
+                # Contact does NOT exist in HubSpot: tell frontend to open push modal
+                logger.info(f"Contact {lead.get('email')} not found in HubSpot, needs push modal")
+                return {
+                    "success": True,
+                    "contact_existed": False,
+                    "needs_push": True,
+                    "message": "Contact not found in HubSpot. Use the push modal to create it."
+                }
+        except Exception as e:
+            hubspot_message = f"HubSpot error: {str(e)}"
+            logger.error(f"Error syncing already-booked to HubSpot: {e}", exc_info=True)
+    
+    # Move lead to already_booked bucket
     lead['status'] = 'already_booked'
     lead['already_booked_at'] = datetime.now().isoformat()
     if reason:
@@ -3391,7 +3982,13 @@ async def mark_lead_already_booked(lead_id: str, request: Request):
     already_booked_leads.append(lead)
     save_leads(lead_queue, pushed_leads, rejected_leads, already_booked_leads)
     
-    return {"success": True}
+    return {
+        "success": True,
+        "contact_existed": True,
+        "hubspot_synced": hubspot_synced,
+        "hubspot_message": hubspot_message,
+        "needs_push": False
+    }
 
 
 @app.post("/api/leads/{lead_id}/enrich")

@@ -1,83 +1,88 @@
 #!/usr/bin/env python3
 """
-Generate stealth tracking links for LinkedIn posts
-Usage: python3 generate_link.py --creator laura --date jan12 --track A3 --cost 400
+Generate clean tracking links for LinkedIn posts.
+
+Links look like natural landing pages (no query params, no codes, no numbers).
+The slug is a real-looking page path. Attribution is stored only in post_database.json.
+
+Usage:
+  python3 generate_link.py --creator eli --slug ecommerce-qa --track A --cost 2400
+  python3 generate_link.py --creator barney --slug retail-quality --track B --cost 3000
+  python3 generate_link.py --creator laura --slug product-accuracy --track A --cost 0
 """
 import json
 import sys
 from datetime import datetime
 from pathlib import Path
 
-def generate_link(creator, date, track, cost):
-    """Generate tracking link and save to post database"""
-    
-    # Generate short code: first letter + day number (e.g., "l12")
-    code = f"{creator[0].lower()}{date.replace('jan', '').replace('feb', '').replace('mar', '').replace('apr', '').replace('may', '').replace('jun', '').replace('jul', '').replace('aug', '').replace('sep', '').replace('oct', '').replace('nov', '').replace('dec', '')}"
-    
-    link = f"https://zenyt.ai/?s={code}"
-    
+
+def generate_link(creator, slug, track, cost):
+    """Generate a clean tracking link and save to post database."""
+
+    # Clean the slug (lowercase, strip leading/trailing slashes)
+    slug = slug.lower().strip("/")
+
+    link = f"https://zenyt.ai/{slug}"
+
     post_data = {
-        "code": code,
+        "slug": slug,
         "creator": creator.lower(),
-        "date": date.lower(),
         "track": track.upper(),
         "cost": int(cost),
         "link": link,
-        "post_url": "",  # To be filled manually
+        "post_url": "",          # Fill once the LinkedIn post is live
         "created_at": datetime.now().isoformat()
     }
-    
+
     # Load existing database
     db_path = Path(__file__).parent.parent / "post_database.json"
     if db_path.exists():
-        with open(db_path, 'r') as f:
+        with open(db_path, "r") as f:
             db = json.load(f)
     else:
         db = {"posts": []}
-    
-    # Check for duplicate codes
-    existing_codes = [p['code'] for p in db.get('posts', [])]
-    if code in existing_codes:
-        print(f"⚠️  Warning: Code '{code}' already exists!")
-        print(f"   Use a different creator name or date.")
+
+    # Check for duplicate slugs
+    existing_slugs = [p.get("slug", p.get("code", "")) for p in db.get("posts", [])]
+    if slug in existing_slugs:
+        print(f"Warning: Slug '{slug}' already exists. Pick a different one.")
         return None
-    
+
     # Add post to database
-    db['posts'].append(post_data)
-    
+    db["posts"].append(post_data)
+
     # Save database
-    with open(db_path, 'w') as f:
+    with open(db_path, "w") as f:
         json.dump(db, f, indent=2)
-    
+
     # Print output
     print(f"""
-✅ Tracking Link Created!
-━━━━━━━━━━━━━━━━━━━━━━━━
-🔗 Link: {link}
-📋 Code: {code}
-👤 Creator: {creator}
-📅 Date: {date}
-🎯 Track: {track}
-💰 Cost: ${cost}
+Link created.
 
-📎 Send this to {creator}:
-━━━━━━━━━━━━━━━━━━━━━━━━
-{link}
+  Link:    {link}
+  Slug:    {slug}
+  Creator: {creator}
+  Track:   {track}
+  Cost:    ${cost}
 
-💾 Saved to post_database.json
+Send this to {creator}:
+  {link}
+
+Saved to post_database.json
     """)
-    
+
     return post_data
+
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Generate LinkedIn post tracking links')
-    parser.add_argument("--creator", required=True, help="Creator name (e.g., laura, nathan)")
-    parser.add_argument("--date", required=True, help="Date (e.g., jan12, feb05)")
-    parser.add_argument("--track", required=True, help="Track name (e.g., A3, B1)")
-    parser.add_argument("--cost", type=int, required=True, help="Promotion cost in $ (e.g., 400)")
-    
+
+    parser = argparse.ArgumentParser(description="Generate clean LinkedIn post tracking links")
+    parser.add_argument("--creator", required=True, help="Creator name (e.g., eli, barney, laura)")
+    parser.add_argument("--slug", required=True, help="Clean URL path (e.g., ecommerce-qa, retail-quality)")
+    parser.add_argument("--track", required=True, help="Track name (e.g., A, B)")
+    parser.add_argument("--cost", type=int, required=True, help="Promotion cost in $ (e.g., 2400)")
+
     args = parser.parse_args()
-    
-    generate_link(args.creator, args.date, args.track, args.cost)
+
+    generate_link(args.creator, args.slug, args.track, args.cost)

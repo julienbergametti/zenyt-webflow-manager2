@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Apollo.io API Integration for Company Enrichment
+Apollo.io API Integration for Company & Person Enrichment
 
 Provides:
 - Company revenue (accurate!)
@@ -9,7 +9,7 @@ Provides:
 - Technologies used
 - Founded year
 - Headquarters location
-- LinkedIn URL
+- LinkedIn URL (company and person)
 """
 
 import os
@@ -57,8 +57,33 @@ class ApolloCompanyData:
         }
 
 
+@dataclass
+class ApolloPersonData:
+    """Person data from Apollo.io People Match"""
+    linkedin_url: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    title: Optional[str] = None
+    headline: Optional[str] = None
+    organization_name: Optional[str] = None
+    city: Optional[str] = None
+    country: Optional[str] = None
+
+    def to_dict(self) -> Dict:
+        return {
+            "linkedin_url": self.linkedin_url,
+            "first_name": self.first_name,
+            "last_name": self.last_name,
+            "title": self.title,
+            "headline": self.headline,
+            "organization_name": self.organization_name,
+            "city": self.city,
+            "country": self.country,
+        }
+
+
 class ApolloEnricher:
-    """Enrich companies using Apollo.io API"""
+    """Enrich companies and people using Apollo.io API"""
     
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("APOLLO_API_KEY")
@@ -67,6 +92,79 @@ class ApolloEnricher:
         if not self.api_key:
             logger.warning("⚠️  APOLLO_API_KEY not found - Apollo enrichment disabled")
     
+    def enrich_person(
+        self,
+        email: Optional[str] = None,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+        organization_name: Optional[str] = None,
+        domain: Optional[str] = None,
+    ) -> Optional[ApolloPersonData]:
+        """
+        Find a person using Apollo People Match API.
+        Tries email first, then falls back to name + company.
+        
+        Returns:
+            ApolloPersonData with linkedin_url or None
+        """
+        if not self.api_key:
+            return None
+
+        headers = {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-cache",
+            "X-Api-Key": self.api_key,
+        }
+        url = f"{self.base_url}/people/match"
+
+        # Strategy 1: match by email
+        if email:
+            try:
+                payload = {"email": email, "reveal_personal_emails": False}
+                resp = requests.post(url, json=payload, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    person = resp.json().get("person")
+                    if person and person.get("linkedin_url"):
+                        logger.info(f"Apollo People Match found person by email: {email}")
+                        return self._parse_person(person)
+            except Exception as e:
+                logger.warning(f"Apollo People Match (email) error: {e}")
+
+        # Strategy 2: match by name + organization
+        if first_name and (organization_name or domain):
+            try:
+                payload = {
+                    "first_name": first_name,
+                    "last_name": last_name or "",
+                    "organization_name": organization_name or "",
+                    "domain": domain or "",
+                    "reveal_personal_emails": False,
+                }
+                resp = requests.post(url, json=payload, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    person = resp.json().get("person")
+                    if person and person.get("linkedin_url"):
+                        logger.info(f"Apollo People Match found person by name: {first_name} {last_name}")
+                        return self._parse_person(person)
+            except Exception as e:
+                logger.warning(f"Apollo People Match (name) error: {e}")
+
+        logger.info(f"Apollo People Match: no LinkedIn found for {email or first_name}")
+        return None
+
+    def _parse_person(self, person: Dict) -> ApolloPersonData:
+        org = person.get("organization") or {}
+        return ApolloPersonData(
+            linkedin_url=person.get("linkedin_url"),
+            first_name=person.get("first_name"),
+            last_name=person.get("last_name"),
+            title=person.get("title"),
+            headline=person.get("headline"),
+            organization_name=org.get("name") or person.get("organization_name"),
+            city=person.get("city"),
+            country=person.get("country"),
+        )
+
     def enrich_company(self, domain: str) -> Optional[ApolloCompanyData]:
         """
         Enrich a company by domain using Apollo.io

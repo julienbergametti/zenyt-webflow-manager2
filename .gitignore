@@ -12,6 +12,12 @@ __pycache__/
 .idea/
 *.swp
 
+# Keys
+*.pem
+
+# EC2 setup script (not needed in repo)
+ec2-user-data.sh
+
 # OS
 .DS_Store
 Thumbs.db
