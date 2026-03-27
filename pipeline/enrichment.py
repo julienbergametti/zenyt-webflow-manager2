@@ -239,7 +239,7 @@ class WebEnricher:
         
         return social_links
     
-    def enrich(self, domain: str) -> EnrichmentResult:
+    async def enrich(self, domain: str) -> EnrichmentResult:
         """
         Enrich lead data by fetching and analyzing the company website.
         
@@ -304,4 +304,8 @@ class WebEnricher:
         
         return result
     
+    def enrich_sync(self, domain: str) -> EnrichmentResult:
+        """Synchronous version of enrich for non-async contexts"""
+        import asyncio
+        return asyncio.get_event_loop().run_until_complete(self.enrich(domain))
 

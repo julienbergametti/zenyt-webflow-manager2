@@ -78,16 +78,8 @@ Dashboard: **http://localhost:3000**
 
 ### Enrichment
 - **Apollo API** - Company data (revenue, employees, industry, tech stack)
-- **Apollo People Match** - Auto-find prospect LinkedIn profiles (~83% hit rate)
 - **ICP Framework** - Automatic qualification scoring
 - **Manual re-enrich** - Update button on each lead card
-
-### Pre-Call Email Draft
-- **Auto-generated** after pushing to HubSpot
-- **Industry-specific** context, questions, and P.S. lines (13 industries)
-- **Agency detection** with tailored questions
-- **LinkedIn connection request** message
-- **Copy buttons** and mailto link in modal
 
 ## Documentation
 

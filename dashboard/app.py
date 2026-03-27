@@ -492,7 +492,12 @@ def fetch_webflow_submissions(form_id: str, limit: int = 100) -> List[Dict]:
 
 
 def apply_post_attribution(lead: Dict) -> Dict:
-    """Apply LinkedIn post attribution based on tracking code"""
+    """Apply LinkedIn post attribution based on tracking code.
+    
+    Supports both legacy format (code/date fields) and current format (slug/created_at).
+    The tracking code from the Webflow form hidden field is matched against
+    either 'code' (old) or 'slug' (current) in post_database.json.
+    """
     code = lead.get('post_source_auto')
     if not code:
         return lead
@@ -507,18 +512,23 @@ def apply_post_attribution(lead: Dict) -> Dict:
         with open(db_path, 'r') as f:
             post_db = json.load(f)
         
-        # Find matching post
-        post = next((p for p in post_db.get('posts', []) if p['code'] == code), None)
+        # Find matching post (supports both old 'code' and current 'slug' fields)
+        post = next(
+            (p for p in post_db.get('posts', [])
+             if p.get('code') == code or p.get('slug') == code),
+            None
+        )
         
         if post:
+            post_date = post.get('date') or post.get('created_at', '')
             lead['post_creator'] = post['creator']
-            lead['post_date'] = post['date']
+            lead['post_date'] = post_date
             lead['post_track'] = post['track']
             lead['post_cost'] = post['cost']
-            lead['post_source'] = f"{post['creator']}_{post['date']}"
-            logger.info(f"✅ Attributed lead {lead.get('email')} → {post['creator']} {post['date']} (track: {post['track']})")
+            lead['post_source'] = f"{post['creator']}_{post_date}"
+            logger.info(f"Attributed lead {lead.get('email')} to {post['creator']} {post_date} (track: {post['track']}, slug: {code})")
         else:
-            logger.warning(f"⚠️  Unknown tracking code: {code}")
+            logger.warning(f"Unknown tracking code/slug: {code}")
     
     except Exception as e:
         logger.error(f"Error applying post attribution: {e}")
@@ -1209,35 +1219,6 @@ DASHBOARD_HTML = """
             background: rgba(10, 102, 194, 0.1);
         }
         
-        .btn-linkedin-find {
-            display: inline-flex; align-items: center; gap: 4px;
-            background: none; border: 1px solid #0a66c2; color: #0a66c2;
-            border-radius: 4px; padding: 1px 6px; font-size: 0.7rem;
-            cursor: pointer; margin-left: 8px; transition: all 0.2s;
-            vertical-align: middle; font-weight: 600;
-        }
-        .btn-linkedin-find:hover { background: rgba(10, 102, 194, 0.15); }
-        .btn-linkedin-find.loading { opacity: 0.6; cursor: wait; }
-        .linkedin-profile-link {
-            color: #0a66c2; margin-left: 8px; font-size: 0.8rem;
-            font-weight: 600; text-decoration: none;
-        }
-        .linkedin-profile-link:hover { text-decoration: underline; }
-        .linkedin-manual-input {
-            display: inline-flex; align-items: center; gap: 4px;
-            margin-left: 8px; font-size: 0.75rem;
-        }
-        .linkedin-manual-input input {
-            background: var(--bg-hover); border: 1px solid var(--border-subtle);
-            color: var(--text-primary); border-radius: 4px; padding: 2px 6px;
-            font-size: 0.75rem; width: 200px;
-        }
-        .linkedin-manual-input button {
-            background: #0a66c2; color: white; border: none;
-            border-radius: 4px; padding: 2px 8px; font-size: 0.7rem;
-            cursor: pointer; font-weight: 600;
-        }
-        
         .lead-grid { display: grid; gap: 0.75rem; }
         
         .lead-card {
@@ -1753,10 +1734,6 @@ DASHBOARD_HTML = """
                         <input type="text" id="push-contact-lastname">
                     </div>
                     <div class="preview-field">
-                        <label>LinkedIn Profile URL</label>
-                        <input type="text" id="push-linkedin-url" placeholder="https://linkedin.com/in/...">
-                    </div>
-                    <div class="preview-field">
                         <label>Contact Owner</label>
                         <select id="push-contact-owner">
                             <option value="">-- No Owner --</option>
@@ -1776,52 +1753,6 @@ DASHBOARD_HTML = """
                 <button class="btn btn-success" id="confirm-push-btn" onclick="confirmPush()">
                     <span>🚀</span> Push to HubSpot
                 </button>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Email Draft Preview Modal -->
-    <div class="modal-overlay" id="email-draft-modal">
-        <div class="modal" style="max-width: 850px;">
-            <h3 style="margin-bottom: 0.25rem;">📧 Pre-Call Email Draft</h3>
-            <p style="color: var(--text-secondary); margin-bottom: 1.25rem; font-size: 0.85rem;">
-                Generated from the push data. Copy or use Cursor to create a draft via Microsoft MCP.
-            </p>
-            
-            <div class="preview-section" style="margin-bottom: 1rem;">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
-                    <div>
-                        <strong style="color: var(--text-secondary); font-size: 0.8rem;">To:</strong>
-                        <span id="draft-to" style="font-size: 0.85rem;"></span>
-                    </div>
-                    <span id="draft-word-count" style="font-size: 0.75rem; color: var(--text-muted);"></span>
-                </div>
-                <div style="margin-bottom: 0.75rem;">
-                    <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.25rem;">
-                        <strong style="color: var(--text-secondary); font-size: 0.8rem;">Subject:</strong>
-                        <span id="draft-subject" style="font-size: 0.85rem; font-weight: 600;"></span>
-                        <button onclick="copyToClipboard(document.getElementById('draft-subject').textContent, 'Subject')" style="background:none;border:1px solid var(--border-subtle);color:var(--text-secondary);border-radius:4px;padding:1px 6px;font-size:0.7rem;cursor:pointer;">Copy</button>
-                    </div>
-                </div>
-                <div style="position: relative;">
-                    <pre id="draft-body" style="background: var(--bg-hover); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 1rem; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.85rem; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; max-height: 350px; overflow-y: auto; color: var(--text-primary);"></pre>
-                    <button onclick="copyToClipboard(document.getElementById('draft-body').textContent, 'Email body')" style="position:absolute;top:8px;right:8px;background:var(--bg-card);border:1px solid var(--border-subtle);color:var(--text-secondary);border-radius:4px;padding:3px 10px;font-size:0.75rem;cursor:pointer;font-weight:600;">Copy Body</button>
-                </div>
-            </div>
-            
-            <div id="draft-linkedin-section" class="preview-section" style="margin-bottom: 1rem; display:none;">
-                <h4 style="font-size: 0.9rem; color: #0a66c2; margin-bottom: 0.5rem;">LinkedIn Connection Request</h4>
-                <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;" id="draft-linkedin-link-row">
-                </div>
-                <div style="position: relative;">
-                    <pre id="draft-linkedin-msg" style="background: var(--bg-hover); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 0.75rem; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.85rem; line-height: 1.4; white-space: pre-wrap; color: var(--text-primary);"></pre>
-                    <button onclick="copyToClipboard(document.getElementById('draft-linkedin-msg').textContent, 'LinkedIn message')" style="position:absolute;top:6px;right:6px;background:var(--bg-card);border:1px solid var(--border-subtle);color:var(--text-secondary);border-radius:4px;padding:2px 8px;font-size:0.7rem;cursor:pointer;">Copy</button>
-                </div>
-            </div>
-            
-            <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end;">
-                <a id="draft-mailto-link" href="#" style="display:inline-flex;align-items:center;gap:4px;padding:8px 16px;background:var(--bg-hover);border:1px solid var(--border-subtle);border-radius:8px;color:var(--text-primary);text-decoration:none;font-size:0.85rem;font-weight:500;">📨 Open in Mail App</a>
-                <button class="btn btn-secondary" onclick="closeEmailDraftModal()">Close</button>
             </div>
         </div>
     </div>
@@ -2084,8 +2015,7 @@ DASHBOARD_HTML = """
             return '';
         }
         
-        const _addLeadForm = document.getElementById('add-lead-form');
-        if (_addLeadForm) _addLeadForm.addEventListener('submit', async (e) => {
+        document.getElementById('add-lead-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const formData = new FormData(e.target);
             const data = {
@@ -2178,7 +2108,6 @@ DASHBOARD_HTML = """
             document.getElementById('push-contact-email').value = lead.email || '';
             document.getElementById('push-contact-firstname').value = firstName;
             document.getElementById('push-contact-lastname').value = lastName;
-            document.getElementById('push-linkedin-url').value = lead.linkedin_profile_url || '';
             
             // Reset other fields to defaults
             document.getElementById('push-company-owner').value = '';
@@ -2235,7 +2164,6 @@ DASHBOARD_HTML = """
                 contact_firstname: document.getElementById('push-contact-firstname').value,
                 contact_lastname: document.getElementById('push-contact-lastname').value,
                 contact_owner: document.getElementById('push-contact-owner').value,
-                linkedin_url: document.getElementById('push-linkedin-url').value,
                 already_booked: isBookedMode
             };
             
@@ -2249,16 +2177,12 @@ DASHBOARD_HTML = """
                 if (response.ok) {
                     const result = await response.json();
                     if (result.already_booked) {
-                        showToast(`Pushed to HubSpot & marked as already booked!`, 'success');
+                        showToast(`Pushed to HubSpot & marked as already booked! (calendly + tracking)`, 'success');
                     } else {
                         showToast(`Pushed to HubSpot! Company: ${result.company_id}`, 'success');
                     }
                     closePushModal();
                     await loadLeads();
-                    
-                    if (result.email_draft) {
-                        showEmailDraftModal(result.email_draft);
-                    }
                 } else {
                     const error = await response.json();
                     showToast(error.detail || 'Error pushing to HubSpot', 'error');
@@ -2357,58 +2281,6 @@ DASHBOARD_HTML = """
             }
         }
         
-        // LinkedIn profile finder
-        async function findLinkedIn(leadId) {
-            const wrapper = document.getElementById('li-btn-' + leadId);
-            if (!wrapper) return;
-            wrapper.innerHTML = '<span class="btn-linkedin-find loading">searching...</span>';
-
-            try {
-                const resp = await fetch('/api/leads/' + leadId + '/find-linkedin', { method: 'POST' });
-                const data = await resp.json();
-
-                if (data.linkedin_url) {
-                    wrapper.innerHTML = '<a href="' + data.linkedin_url + '" target="_blank" class="linkedin-profile-link" title="LinkedIn Profile">in</a>';
-                    showToast('LinkedIn found' + (data.person_title ? ' (' + data.person_title + ')' : ''), 'success');
-                } else {
-                    wrapper.innerHTML =
-                        '<span class="linkedin-manual-input">' +
-                        '<input type="text" id="li-input-' + leadId + '" placeholder="Paste LinkedIn URL">' +
-                        '<button onclick="saveLinkedIn(\\'' + leadId + '\\')">Save</button>' +
-                        ' <a href="' + data.search_links.google + '" target="_blank" style="color:#0a66c2;font-size:0.7rem;">Google</a>' +
-                        ' <a href="' + data.search_links.linkedin + '" target="_blank" style="color:#0a66c2;font-size:0.7rem;">LI</a>' +
-                        '</span>';
-                    showToast('Not found automatically. Paste URL or use search links.', 'info');
-                }
-            } catch (err) {
-                wrapper.innerHTML = '<button class="btn-linkedin-find" onclick="findLinkedIn(\\'' + leadId + '\\')">in?</button>';
-                showToast('LinkedIn search error: ' + err.message, 'error');
-            }
-        }
-
-        async function saveLinkedIn(leadId) {
-            const input = document.getElementById('li-input-' + leadId);
-            const url = (input && input.value || '').trim();
-            if (!url) { showToast('Please paste a LinkedIn URL', 'error'); return; }
-
-            try {
-                const resp = await fetch('/api/leads/' + leadId + '/save-linkedin', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ linkedin_url: url })
-                });
-                if (resp.ok) {
-                    const wrapper = document.getElementById('li-btn-' + leadId);
-                    wrapper.innerHTML = '<a href="' + url + '" target="_blank" class="linkedin-profile-link" title="LinkedIn Profile">in</a>';
-                    showToast('LinkedIn URL saved', 'success');
-                } else {
-                    showToast('Failed to save', 'error');
-                }
-            } catch (err) {
-                showToast('Error: ' + err.message, 'error');
-            }
-        }
-
         // Re-enrich a lead with Apollo API
         async function reEnrichLead(leadId) {
             const button = event.target;
@@ -2518,14 +2390,7 @@ DASHBOARD_HTML = """
                     <div class="lead-header">
                         <div class="lead-info">
                             <h3>${lead.company_name || lead.website}</h3>
-                            <div class="email">
-                                ${lead.email}
-                                <span id="li-btn-${lead.id}">
-                                ${lead.linkedin_profile_url
-                                    ? `<a href="${lead.linkedin_profile_url}" target="_blank" class="linkedin-profile-link" title="LinkedIn Profile">in</a>`
-                                    : `<button class="btn-linkedin-find" onclick="findLinkedIn('${lead.id}')" title="Find LinkedIn profile">in?</button>`}
-                                </span>
-                            </div>
+                            <div class="email">${lead.email}</div>
                             <div class="lead-date">📅 ${formatDate(lead.created_at)}</div>
                         </div>
                         <div class="lead-badges">
@@ -2538,6 +2403,7 @@ DASHBOARD_HTML = """
                             ${lead.meeting_completed ? '<span class="badge" style="background: #22c55e; color: white;">✅ Meeting Done</span>' : ''}
                             ${lead.is_fast_track ? '<span class="badge" style="background: #f59e0b; color: white;">⚡ Fast Track</span>' : ''}
                             ${lead.deal_status === 'won' ? '<span class="badge" style="background: #8b5cf6; color: white;">🏆 Won</span>' : ''}
+                            ${lead.post_creator ? '<span class="badge" style="background: #6366f1; color: white;">📱 ' + lead.post_creator.charAt(0).toUpperCase() + lead.post_creator.slice(1) + (lead.post_source_auto ? ' (' + lead.post_source_auto + ')' : '') + '</span>' : ''}
                         </div>
                     </div>
                     
@@ -3197,52 +3063,10 @@ DASHBOARD_HTML = """
         
         function showToast(message, type = 'success') {
             const toast = document.getElementById('toast');
-            document.getElementById('toast-icon').textContent = type === 'success' ? '✅' : type === 'info' ? 'ℹ️' : '❌';
+            document.getElementById('toast-icon').textContent = type === 'success' ? '✅' : '❌';
             document.getElementById('toast-message').textContent = message;
             toast.className = `toast show ${type}`;
             setTimeout(() => toast.classList.remove('show'), 3000);
-        }
-        
-        function copyToClipboard(text, label) {
-            navigator.clipboard.writeText(text).then(() => {
-                showToast(label + ' copied to clipboard', 'success');
-            }).catch(() => {
-                const ta = document.createElement('textarea');
-                ta.value = text;
-                document.body.appendChild(ta);
-                ta.select();
-                document.execCommand('copy');
-                document.body.removeChild(ta);
-                showToast(label + ' copied', 'success');
-            });
-        }
-        
-        function showEmailDraftModal(draft) {
-            document.getElementById('draft-to').textContent = draft.to || '';
-            document.getElementById('draft-subject').textContent = draft.subject || '';
-            document.getElementById('draft-body').textContent = draft.body || '';
-            document.getElementById('draft-word-count').textContent = draft.word_count ? '~' + draft.word_count + ' words' : '';
-            document.getElementById('draft-mailto-link').href = draft.mailto_link || '#';
-            
-            const liSection = document.getElementById('draft-linkedin-section');
-            if (draft.linkedin_message) {
-                liSection.style.display = 'block';
-                document.getElementById('draft-linkedin-msg').textContent = draft.linkedin_message;
-                const linkRow = document.getElementById('draft-linkedin-link-row');
-                if (draft.linkedin_url) {
-                    linkRow.innerHTML = '<a href="' + draft.linkedin_url + '" target="_blank" style="color:#0a66c2;font-weight:600;font-size:0.85rem;">Open LinkedIn Profile →</a>';
-                } else {
-                    linkRow.innerHTML = '<span style="color:var(--text-muted);font-size:0.8rem;">No LinkedIn URL found. Search manually before sending.</span>';
-                }
-            } else {
-                liSection.style.display = 'none';
-            }
-            
-            document.getElementById('email-draft-modal').classList.add('show');
-        }
-        
-        function closeEmailDraftModal() {
-            document.getElementById('email-draft-modal').classList.remove('show');
         }
         
         async function loadLeads() {
@@ -3600,12 +3424,6 @@ async def push_to_hubspot(lead_id: str, request: Request):
         if contact_owner:
             contact_props['hubspot_owner_id'] = contact_owner
         
-        # Add LinkedIn profile URL if available
-        linkedin_url = push_data.get('linkedin_url', '').strip()
-        if linkedin_url:
-            contact_props['linkedin'] = linkedin_url
-            lead['linkedin_profile_url'] = linkedin_url
-        
         # Add LinkedIn post tracking properties if available
         if lead.get('post_source_auto'):
             contact_props['linkedin_post_source'] = lead.get('post_source_auto')
@@ -3658,16 +3476,27 @@ async def push_to_hubspot(lead_id: str, request: Request):
             pushed_leads.append(lead)
         save_leads(lead_queue, pushed_leads, rejected_leads, already_booked_leads)
         
-        # Always generate the email draft for demo requests
-        contact_email = push_data.get('contact_email') or lead.get('email', '')
-        contact_firstname = push_data.get('contact_firstname') or lead.get('firstname', '')
-        contact_lastname = push_data.get('contact_lastname') or lead.get('lastname', '')
-        website_url = push_data.get('company_domain') or lead.get('website') or lead.get('domain', '')
-        industry = lead.get('industry') or company_props.get('industry')
-        
-        email_data = None
-        if generate_demo_request_email:
+        # Auto-generate demo request email and prospect files if this is a demo request
+        prospect_created = False
+        if is_demo_request(lead) and PROSPECT_GENERATION_AVAILABLE:
             try:
+                # Get settings for paths
+                try:
+                    settings = get_settings()
+                    prospects_base_path = settings.prospect.prospects_base_path
+                except Exception:
+                    # Fallback path if settings not available
+                    workspace_root = Path(__file__).parent.parent.parent.parent
+                    prospects_base_path = workspace_root / "zenyt_sales" / "prospects"
+                
+                # Get contact and company info
+                contact_email = push_data.get('contact_email') or lead.get('email', '')
+                contact_firstname = push_data.get('contact_firstname') or lead.get('firstname', '')
+                contact_lastname = push_data.get('contact_lastname') or lead.get('lastname', '')
+                website_url = push_data.get('company_domain') or lead.get('website') or lead.get('domain', '')
+                industry = lead.get('industry') or company_props.get('industry')
+                
+                # Generate email
                 email_data = generate_demo_request_email(
                     contact_email=contact_email,
                     contact_firstname=contact_firstname,
@@ -3675,29 +3504,16 @@ async def push_to_hubspot(lead_id: str, request: Request):
                     company_name=company_name,
                     website_url=website_url,
                     industry=industry,
-                    company_country=None,
-                    scan_url=lead.get('website') or lead.get('domain', ''),
-                    linkedin_url=linkedin_url or lead.get('linkedin_profile_url'),
+                    company_country=None  # Could be added from Apollo data
                 )
-            except Exception as e:
-                logger.error(f"Email generation failed: {e}", exc_info=True)
-        
-        # Auto-generate prospect files if this is a demo request
-        prospect_created = False
-        if is_demo_request(lead) and PROSPECT_GENERATION_AVAILABLE and email_data:
-            try:
-                try:
-                    settings = get_settings()
-                    prospects_base_path = settings.prospect.prospects_base_path
-                except Exception:
-                    workspace_root = Path(__file__).parent.parent.parent.parent
-                    prospects_base_path = workspace_root / "zenyt_sales" / "prospects"
                 
+                # Create prospect folder
                 prospect_folder = create_prospect_folder(
                     prospects_base_path=prospects_base_path,
                     company_name=company_name
                 )
                 
+                # Create campaign overview
                 contact_full_name = f"{contact_firstname} {contact_lastname}".strip() or contact_email.split('@')[0]
                 create_campaign_overview(
                     folder_path=prospect_folder,
@@ -3711,6 +3527,7 @@ async def push_to_hubspot(lead_id: str, request: Request):
                     agency_name=email_data.get('agency_name')
                 )
                 
+                # Create touch 1 file
                 create_touch_1_file(
                     folder_path=prospect_folder,
                     contact_firstname=contact_firstname,
@@ -3728,6 +3545,7 @@ async def push_to_hubspot(lead_id: str, request: Request):
                 
             except Exception as e:
                 logger.error(f"Failed to create prospect files: {e}", exc_info=True)
+                # Don't fail the push if prospect creation fails
         
         response_data = {
             "success": True,
@@ -3740,18 +3558,6 @@ async def push_to_hubspot(lead_id: str, request: Request):
         if prospect_created:
             response_data["prospect_folder"] = str(prospect_folder)
         
-        if email_data:
-            response_data["email_draft"] = {
-                "to": email_data.get("to", contact_email),
-                "subject": email_data.get("subject", ""),
-                "body": email_data.get("body", ""),
-                "mailto_link": email_data.get("mailto_link", ""),
-                "linkedin_message": email_data.get("linkedin_message", ""),
-                "linkedin_url": email_data.get("linkedin_url", ""),
-                "word_count": email_data.get("word_count", 0),
-                "is_agency": email_data.get("is_agency", False),
-            }
-        
         return response_data
         
     except HTTPException:
@@ -3759,80 +3565,6 @@ async def push_to_hubspot(lead_id: str, request: Request):
     except Exception as e:
         logger.error(f"Error pushing to HubSpot: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/leads/{lead_id}/find-linkedin")
-async def find_linkedin_profile(lead_id: str):
-    """Auto-find the prospect's personal LinkedIn profile using Apollo People Match."""
-    lead_queue, pushed_leads, rejected_leads, already_booked_leads = load_leads()
-    all_leads = lead_queue + pushed_leads + rejected_leads + already_booked_leads
-    lead = next((l for l in all_leads if l['id'] == lead_id), None)
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
-
-    enricher = ApolloEnricher()
-    if not enricher.api_key:
-        raise HTTPException(status_code=503, detail="Apollo API key not configured")
-
-    first_name, last_name = '', ''
-    if lead.get('full_name'):
-        parts = lead['full_name'].split(' ', 1)
-        first_name = parts[0]
-        last_name = parts[1] if len(parts) > 1 else ''
-
-    email = lead.get('email')
-    company = lead.get('company_name') or ''
-    domain = lead.get('domain') or lead.get('website') or ''
-
-    person = enricher.enrich_person(
-        email=email,
-        first_name=first_name,
-        last_name=last_name,
-        organization_name=company,
-        domain=domain,
-    )
-
-    linkedin_url = person.linkedin_url if person else None
-
-    if linkedin_url:
-        lead['linkedin_profile_url'] = linkedin_url
-        save_leads(
-            [l for l in lead_queue],
-            pushed_leads,
-            rejected_leads,
-            already_booked_leads,
-        )
-        logger.info(f"Found LinkedIn for {lead_id}: {linkedin_url}")
-
-    search_name = f"{first_name} {last_name}".strip() or email
-    return {
-        "linkedin_url": linkedin_url,
-        "person_title": person.title if person else None,
-        "search_links": {
-            "google": f"https://www.google.com/search?q=site%3Alinkedin.com%2Fin+%22{search_name}%22+%22{company}%22",
-            "linkedin": f"https://www.linkedin.com/search/results/people/?keywords={search_name} {company}",
-        },
-    }
-
-
-@app.post("/api/leads/{lead_id}/save-linkedin")
-async def save_linkedin_profile(lead_id: str, request: Request):
-    """Manually save a prospect's LinkedIn profile URL."""
-    body = await request.json()
-    url = (body.get('linkedin_url') or '').strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="linkedin_url is required")
-
-    lead_queue, pushed_leads, rejected_leads, already_booked_leads = load_leads()
-    all_leads = lead_queue + pushed_leads + rejected_leads + already_booked_leads
-    lead = next((l for l in all_leads if l['id'] == lead_id), None)
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
-
-    lead['linkedin_profile_url'] = url
-    save_leads(lead_queue, pushed_leads, rejected_leads, already_booked_leads)
-    logger.info(f"Saved LinkedIn URL for {lead_id}: {url}")
-    return {"success": True, "linkedin_url": url}
 
 
 @app.post("/api/leads/{lead_id}/test")

@@ -60,7 +60,7 @@ When you click "Push to HubSpot" on a lead:
 - First Name / Last Name
 - Email (unique identifier)
 - Job Title
-- LinkedIn URL (personal, from Apollo People Match or manual entry)
+- LinkedIn URL (personal)
 - LinkedIn post properties (source, creator, date, track)
 
 **Company created/updated with:**
@@ -75,17 +75,6 @@ When you click "Push to HubSpot" on a lead:
 
 **Auto-association:**
 - Contact automatically associated to Company by domain
-
-**Pre-call email draft (auto-generated):**
-
-After a successful push, the dashboard generates a personalized pre-call email and shows it in a modal with copy buttons. The email includes:
-- Industry-specific context paragraph and P.S. line
-- Agency detection (adds portfolio question for agencies)
-- Calendly CTA for booking a call
-- LinkedIn connection request message
-- Mailto link for quick sending
-
-The email content can also be used via the Microsoft MCP `create_email_draft` tool in Cursor.
 
 ### Duplicate Prevention
 
